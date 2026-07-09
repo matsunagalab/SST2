@@ -25,6 +25,7 @@ logger.setLevel(logging.INFO)
 # Add sys.sdout as handler
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
+logger.info(f" SST2 library path used : {SST2.__path__}")
 
 def parser_input():
     # Parse arguments :
