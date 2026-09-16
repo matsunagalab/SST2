@@ -41,6 +41,10 @@ sst2-from-xml = "SST2.driver:main"
 [project.urls]
 Homepage = "https://sst2.readthedocs.io"
 
+[tool.setuptools.package-data]
+# Small test systems (1.1 MB) so the installed package can be self-tested.
+SST2 = ["tests/inputs/*.pdb"]
+
 [tool.setuptools.dynamic]
 # version = {attr = "SST2.VERSION"}
 readme = {file = ["README.md"]}
