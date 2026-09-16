@@ -219,3 +219,53 @@ def test_partial_solute_boundary_14_scaled():
         assert eps._value == pytest.approx(eps1._value * np.sqrt(scale), rel=1e-6, abs=1e-12), (
             f"boundary exception {i} ({p1},{p2}) epsilon not scaled by sqrt(lambda)"
         )
+
+
+def test_partial_solute_subsystems_keep_original_bonds():
+    """The solute-only and solvent-only sub-topologies must contain exactly
+    the bonds of the full topology restricted to their atoms.  Rebuilding
+    them from a PDB file used to add a peptide bond between the two
+    residues flanking the solute (they become adjacent in the chain)."""
+    selection = "chain B and resid > 1 and resid < 5"
+    coor = pdb_numpy.Coor(PDB_PROT_PEP_SOL)
+    solute_indices = coor.get_index_select(selection)
+    solute = set(solute_indices)
+
+    forcefield = app.ForceField("amber14-all.xml", "amber14/tip3pfb.xml")
+    dt = 2 * unit.femtosecond
+    temperature = 300 * unit.kelvin
+    friction = 1 / unit.picoseconds
+    pdb = app.PDBFile(PDB_PROT_PEP_SOL)
+    system = forcefield.createSystem(
+        pdb.topology,
+        nonbondedMethod=app.PME,
+        nonbondedCutoff=1 * unit.nanometers,
+        constraints=app.HBonds,
+    )
+    test = rest2.REST2(
+        system=system,
+        pdb=pdb,
+        forcefield=forcefield,
+        solute_index=solute_indices,
+        integrator=openmm.LangevinMiddleIntegrator(temperature, friction, dt),
+        temperature=temperature,
+        dt=dt,
+        platform_name=tools.get_fastest_platform_name(),
+    )
+    n_solute_bonds = sum(
+        1 for a, b in pdb.topology.bonds() if a.index in solute and b.index in solute
+    )
+    n_solvent_bonds = sum(
+        1 for a, b in pdb.topology.bonds() if a.index not in solute and b.index not in solute
+    )
+    assert test.simulation_solute.topology.getNumBonds() == n_solute_bonds
+    assert test.simulation_solvent.topology.getNumBonds() == n_solvent_bonds
+
+    # no bond may join two residues that are not consecutive in the full topology
+    for top in (test.simulation_solute.topology, test.simulation_solvent.topology):
+        for a, b in top.bonds():
+            if a.residue is not b.residue and a.residue.chain is b.residue.chain:
+                assert abs(int(a.residue.id) - int(b.residue.id)) == 1, (
+                    f"spurious bond {a.residue.name}{a.residue.id}:{a.name}-"
+                    f"{b.residue.name}{b.residue.id}:{b.name}"
+                )

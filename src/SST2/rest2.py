@@ -662,9 +662,15 @@ class REST2:
             charge, sigma, epsilon = nonbonded_force.getParticleParameters(i)
             self.init_nb_param[i] = [charge, sigma, epsilon]
 
-        # Copy solute-solute exclusions
+        # Copy solute-solute exceptions (scaled by lambda) and boundary
+        # exceptions with exactly one solute atom (scaled by sqrt(lambda),
+        # gREST k/l rule with k=1, l=2).  Boundary exceptions only exist
+        # when the solute is a part of a molecule.
+        solute_set = set(self.solute_index)
         self.init_nb_exept_index = []
         self.init_nb_exept_value = []
+        self.init_nb_exept_boundary_index = []
+        self.init_nb_exept_boundary_value = []
 
         for exception_index in range(nonbonded_force.getNumExceptions()):
             [
@@ -675,11 +681,23 @@ class REST2:
                 epsilon,
             ] = nonbonded_force.getExceptionParameters(exception_index)
 
-            if iatom in self.solute_index and jatom in self.solute_index:
+            n_solute = (iatom in solute_set) + (jatom in solute_set)
+            if n_solute == 2:
                 self.init_nb_exept_index.append(exception_index)
                 self.init_nb_exept_value.append(
                     [iatom, jatom, chargeprod, sigma, epsilon]
                 )
+            elif n_solute == 1:
+                self.init_nb_exept_boundary_index.append(exception_index)
+                self.init_nb_exept_boundary_value.append(
+                    [iatom, jatom, chargeprod, sigma, epsilon]
+                )
+
+        if self.init_nb_exept_boundary_index:
+            logger.info(
+                f"- {len(self.init_nb_exept_boundary_index)} nonbonded exceptions "
+                f"cross the solute boundary, scaled by sqrt(lambda)"
+            )
 
     def separate_cmap_pot(self):
         """
@@ -961,34 +979,31 @@ class REST2:
 
         """
 
-        # Save pdb coordinates to read them with pdb_numpy
-        solvent_stdout = StringIO()
-        solute_stdout = StringIO()
-
+        # Build the sub-topologies directly from the full topology
+        # (Modeller.delete keeps the original bonds and box vectors).
+        # Do NOT round-trip them through a PDB file: PDBFile.createStandardBonds
+        # would join residues that became adjacent in a chain after the
+        # solute was removed (e.g. the two residues flanking a partial
+        # solute), adding a spurious peptide bond and its 1-2/1-3/1-4 terms.
         solvent_top, solvent_pos = get_subset(
             self.topology, self.positions, keep=self.solvent_index, types="atom"
         )
-        app.PDBFile.writeFile(solvent_top, solvent_pos, solvent_stdout, True)
-
-        # Need to use the get_subset function because of small molecule issue related
         solute_top, solute_pos = get_subset(
             self.topology, self.positions, keep=self.solute_index, types="atom"
         )
+        logger.info(f"Solute sub-topology: {solute_top}")
+        logger.info(f"Solvent sub-topology: {solvent_top}")
 
-        app.PDBFile.writeFile(solute_top, solute_pos, solute_stdout, True)
-
-        # In the case of Charmm forcefield, modify NBFIX force before creating simulation
         solute_integrator = openmm.LangevinMiddleIntegrator(
             temperature,
             friction,
             dt
         )
 
-        pdb_solute = app.PDBFile(StringIO(solute_stdout.getvalue()))
-        logger.info(f"Number of atoms in solute pdb: {pdb_solute.topology}")
-
+        # ignoreExternalBonds: residues at a solute/solvent boundary lack the
+        # bond their template expects.
         self.system_solute = forcefield.createSystem(
-            pdb_solute.topology,
+            solute_top,
             nonbondedMethod=nonbondedMethod,
             nonbondedCutoff=nonbondedCutoff,
             constraints=constraints,
@@ -1006,32 +1021,33 @@ class REST2:
             NBFIX_force = self.system_forces_solute["CustomNonbondedForce"]
             logger.info(f"Add solute flag to CustomNonbondedForce and update energy function to scale NBFIX terms")
             self.add_scale_NBFIX(NBFIX_force, range(len(self.solute_index)))
-        # This is useless as the value is accessible in the original system
-        # if self.lj14_flag:
-        #     self.add_scale_LJ14(self.system_solute, range(len(self.solute_index)))
 
         self.simulation_solute = setup_simulation(
             system=self.system_solute,
-            position=pdb_solute.positions,
-            topology=pdb_solute.topology,
+            position=solute_pos,
+            topology=solute_top,
             integrator=solute_integrator,
             temperature=temperature,
             platform_name=platform_name
         )
 
-        self.system_solvent, self.simulation_solvent = create_system_simulation(
-            file_io=StringIO(solvent_stdout.getvalue()),
-            cif_format=False,
-            forcefield=forcefield,
+        self.system_solvent = forcefield.createSystem(
+            solvent_top,
             nonbondedMethod=nonbondedMethod,
             nonbondedCutoff=nonbondedCutoff,
-            temperature=temperature,
             constraints=constraints,
-            platform_name=platform_name,
             rigidWater=rigidWater,
             ewaldErrorTolerance=ewaldErrorTolerance,
             hydrogenMass=hydrogenMass,
             ignoreExternalBonds=True,
+        )
+        self.simulation_solvent = setup_simulation(
+            system=self.system_solvent,
+            position=solvent_pos,
+            topology=solvent_top,
+            integrator=openmm.LangevinMiddleIntegrator(temperature, friction, dt),
+            temperature=temperature,
+            platform_name=platform_name
         )
 
         self.system_forces_solvent = {
@@ -1378,6 +1394,13 @@ class REST2:
             p1, p2, q, sigma, eps = self.init_nb_exept_value[i]
             nonbonded_force.setExceptionParameters(
                 index, p1, p2, q * scale, sigma, eps * scale
+            )
+        # Boundary 1-4 pairs are solute-solvent interactions: sqrt(lambda)
+        for i in range(len(self.init_nb_exept_boundary_index)):
+            index = self.init_nb_exept_boundary_index[i]
+            p1, p2, q, sigma, eps = self.init_nb_exept_boundary_value[i]
+            nonbonded_force.setExceptionParameters(
+                index, p1, p2, q * sqrt_scale, sigma, eps * sqrt_scale
             )
         # Need to fix simulation
         nonbonded_force.updateParametersInContext(self.simulation.context)
