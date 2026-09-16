@@ -1369,10 +1369,11 @@ class REST2:
 
         """
 
-        # Add PT MonteCarlo barostat
-        self.system.addForce(
-            openmm.MonteCarloBarostat(pressure, temperature, barostatInterval)
-        )
+        # Add PT MonteCarlo barostat (pressure=None: NVT)
+        if pressure is not None:
+            self.system.addForce(
+                openmm.MonteCarloBarostat(pressure, temperature, barostatInterval)
+            )
 
         self.simulation = setup_simulation(
             system=self.system,
