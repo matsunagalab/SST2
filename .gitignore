@@ -129,5 +129,6 @@ dmypy.json
 .pyre/
 
 # Test files
-tmp*.pylib/
+tmp*
+.pylib/
 __pycache__/
