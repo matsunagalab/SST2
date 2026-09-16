@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "SST2"
-version = "0.0.1"
+version = "0.0.1+mdclaw.1"
 dynamic = ["readme", "dependencies"]
 description = "`SST2` is a python library designed to conduct Simulated Solute Tempering (SST2) simulations using the openmm library."
-license = {text = "GNUv2.0"}
+license = {text = "GPL-2.0"}
 requires-python = ">=3.7"
 authors = [
     { name = "Samuel Murail", email = "samuel.murail@u-paris.fr" },
@@ -23,7 +23,7 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Natural Language :: English",
-    "License :: OSI Approved :: BSD License",
+    "License :: OSI Approved :: GNU General Public License v2 (GPLv2)",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.7",
@@ -36,7 +36,7 @@ classifiers = [
 ]
 
 [project.scripts]
-SST2 = "SST2.__main__:main"
+sst2-from-xml = "SST2.driver:main"
 
 [project.urls]
 Homepage = "https://sst2.readthedocs.io"

@@ -13,7 +13,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 __author__ = "Samuel Murail"
-__version__ = "0.0.1"
+__version__ = "0.0.1+mdclaw.1"
 
 import openmm.unit as unit
 import random
