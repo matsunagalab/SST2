@@ -8,6 +8,7 @@ import pandas as pd
 import sys
 import os
 import logging
+import copy
 import pdb_numpy.format
 import time
 
@@ -27,6 +28,7 @@ try:
         create_custom_bonded_force_rf,
     )
     from .topology import get_subset
+    from .subsystem import build_subsystem, subset_topology_positions
 except ImportError:
     from tools import (
         setup_simulation,
@@ -38,6 +40,7 @@ except ImportError:
         create_custom_bonded_force_rf,
     )
     from topology import get_subset
+    from subsystem import build_subsystem, subset_topology_positions
 
 # Logging
 logger = logging.getLogger(__name__)
@@ -209,6 +212,7 @@ class REST2:
         ewaldErrorTolerance=0.0005,
         hydrogenMass=1.0 * unit.amu,
         exclude_Pro_omegas=False,
+        subsystem="forcefield",
     ):
         """Initialize the REST2 class
 
@@ -260,7 +264,24 @@ class REST2:
             The hydrogen mass of the system, default is 1 amu
         exclude_Pro_omegas : bool
             The exclusion of the proline omegas scaling, default is False
+        subsystem : str
+            How the solute-only and solvent-only Systems used for the PME
+            energy decomposition are built: ``"forcefield"`` re-parametrises
+            the sub-topologies with ``forcefield`` (upstream behaviour);
+            ``"copy"`` copies the particles and interaction terms out of
+            ``system`` itself (``forcefield`` may then be None; required for
+            Systems that have no ForceField, e.g. Amber prmtop or a
+            serialized system.xml).  PME only.
         """
+
+        if subsystem not in ("forcefield", "copy"):
+            raise ValueError(f"subsystem must be 'forcefield' or 'copy', got {subsystem!r}")
+        if subsystem == "forcefield" and forcefield is None:
+            raise ValueError("subsystem='forcefield' needs a ForceField object")
+        self.subsystem_mode = subsystem
+        # Pristine copy of the System, taken before the torsion / LJ14 / NBFIX
+        # forces are split: the copied sub-Systems are derived from it.
+        self._pristine_system = copy.deepcopy(system) if subsystem == "copy" else None
 
         self._init_core(system, pdb, solute_index)
 
@@ -411,22 +432,32 @@ class REST2:
                 self.alpha_ewald = (np.sqrt(-np.log(tolerance)) / cutoff).in_units_of(unit.nanometers**-1)
 
             logger.info(f"- PME alpha: {self.alpha_ewald}")
-            self.create_solute_solvent_simulation(
-                forcefield=forcefield,
-                platform_name=platform_name,
-                nonbondedMethod=nonbondedMethod,
-                nonbondedCutoff=nonbondedCutoff,
-                constraints=constraints,
-                rigidWater=rigidWater,
-                ewaldErrorTolerance=ewaldErrorTolerance,
-                hydrogenMass=hydrogenMass,
-                friction=friction,
-                dt=dt,
-                temperature=temperature,
-            )
+            if self.subsystem_mode == "copy":
+                self.create_solute_solvent_simulation_copy(
+                    platform_name=platform_name,
+                    friction=friction,
+                    dt=dt,
+                    temperature=temperature,
+                )
+            else:
+                self.create_solute_solvent_simulation(
+                    forcefield=forcefield,
+                    platform_name=platform_name,
+                    nonbondedMethod=nonbondedMethod,
+                    nonbondedCutoff=nonbondedCutoff,
+                    constraints=constraints,
+                    rigidWater=rigidWater,
+                    ewaldErrorTolerance=ewaldErrorTolerance,
+                    hydrogenMass=hydrogenMass,
+                    friction=friction,
+                    dt=dt,
+                    temperature=temperature,
+                )
             self.find_nb_solute_system()
 
         elif nonbondedMethod == app.CutoffPeriodic:
+            if self.subsystem_mode == "copy":
+                raise NotImplementedError("subsystem='copy' supports PME only")
             logger.info("Create systems with Reaction Field")
             self.reaction_field = True
             self.create_rf_simulation(
@@ -1050,6 +1081,57 @@ class REST2:
             platform_name=platform_name
         )
 
+        self.system_forces_solvent = {
+            type(force).__name__: force for force in self.system_solvent.getForces()
+        }
+
+    def create_solute_solvent_simulation_copy(
+        self,
+        platform_name="CUDA",
+        friction=1 / unit.picoseconds,
+        dt=2 * unit.femtosecond,
+        temperature=300 * unit.kelvin,
+    ):
+        """Build the solute-only and solvent-only Simulations by copying
+        the pristine System (see ``SST2.subsystem.build_subsystem``).
+        Equivalent to :meth:`create_solute_solvent_simulation` but needs
+        no ForceField and reproduces the parent nonbonded settings
+        exactly."""
+        solute_top, solute_pos = subset_topology_positions(
+            self.topology, self.positions, self.solute_index
+        )
+        solvent_top, solvent_pos = subset_topology_positions(
+            self.topology, self.positions, self.solvent_index
+        )
+        logger.info(f"Solute sub-topology: {solute_top}")
+        logger.info(f"Solvent sub-topology: {solvent_top}")
+
+        self.system_solute, _ = build_subsystem(self._pristine_system, self.solute_index)
+        self.system_forces_solute = {
+            type(force).__name__: force for force in self.system_solute.getForces()
+        }
+        if self.NBFIX_flag:
+            NBFIX_force = self.system_forces_solute["CustomNonbondedForce"]
+            logger.info("Add solute flag to CustomNonbondedForce and update energy function to scale NBFIX terms")
+            self.add_scale_NBFIX(NBFIX_force, range(len(self.solute_index)))
+        self.simulation_solute = setup_simulation(
+            system=self.system_solute,
+            position=solute_pos,
+            topology=solute_top,
+            integrator=openmm.LangevinMiddleIntegrator(temperature, friction, dt),
+            temperature=temperature,
+            platform_name=platform_name,
+        )
+
+        self.system_solvent, _ = build_subsystem(self._pristine_system, self.solvent_index)
+        self.simulation_solvent = setup_simulation(
+            system=self.system_solvent,
+            position=solvent_pos,
+            topology=solvent_top,
+            integrator=openmm.LangevinMiddleIntegrator(temperature, friction, dt),
+            temperature=temperature,
+            platform_name=platform_name,
+        )
         self.system_forces_solvent = {
             type(force).__name__: force for force in self.system_solvent.getForces()
         }
