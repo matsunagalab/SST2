@@ -161,6 +161,8 @@ class SST2(object):
         reportFile=stdout,
         restart_files=None,
         restart_files_full=None,
+        seed=None,
+        move="gibbs",
     ):
         """Create a new SimulatedTempering.
 
@@ -184,9 +186,22 @@ class SST2(object):
             Files to read restart information to, specified as a file name
         restart_files_full: string
             Full Rest2 files to read restart information to, specified as a file name
+        seed: int or None
+            Seed of the random number generator used for rung moves.
+        move: str
+            ``"gibbs"``: at every attempt the new rung is drawn from the
+            conditional distribution over all rungs (independence sampling,
+            Chodera & Shirts 2011).  ``"neighbor"``: propose i-1 or i+1 with
+            probability 1/2 each (a proposal outside the ladder is rejected)
+            and accept with the Metropolis criterion.  Both satisfy detailed
+            balance in the rung index.
         """
         self.rest2 = rest2
         self.simulation = rest2.simulation
+        if move not in ("gibbs", "neighbor"):
+            raise ValueError(f"move must be 'gibbs' or 'neighbor', got {move!r}")
+        self.move = move
+        self._rng = random.Random(seed)
 
         numTemperatures = len(temperatures)
         self.temperatures = [
@@ -237,24 +252,29 @@ class SST2(object):
 
         # Initialize the weights.
 
+        # The running averages are needed in both modes: they feed the
+        # on-the-fly weights when adapting, and are still reported (and can
+        # seed a later adaptive stage) when the weights are fixed.
+        first_temp_index = self.compute_starting_weight(
+            restart_files, restart_files_full
+        )
         if weights is None:
-            first_temp_index = self.compute_starting_weight(
-                restart_files, restart_files_full
-            )
             self._updateWeights = True
         else:
-            self._weights = weights
+            if len(weights) != numTemperatures:
+                raise ValueError(
+                    f"{len(weights)} weights given for {numTemperatures} rungs"
+                )
+            # Fixed weights: free energies f_m of the rungs in kJ/mol
+            # (same convention as _compute_weight, which estimates f_j - f_i).
+            self._weights = [
+                w.value_in_unit(unit.kilojoules_per_mole) if unit.is_quantity(w) else float(w)
+                for w in weights
+            ]
             self._updateWeights = False
 
         # Select the initial temperature.
-        if restart_files is None:
-            self.currentTemperature = 0
-        elif weights is None:
-            self.currentTemperature = first_temp_index
-        else:
-            # Need to treat the case where weights is not None and restart_files is not None
-            # TO CHANGE ! This is BAD MOKAY !!!!! :
-            self.currentTemperature = 0
+        self.currentTemperature = first_temp_index if restart_files is not None else 0
 
         # print(self.temperatures[self.currentTemperature])
         # self.simulation.integrator.setTemperature(self.temperatures[self.currentTemperature])
@@ -270,6 +290,9 @@ class SST2(object):
         frac_headers = [
             f"E frac {frac} (kJ/mole)" for frac in self._e_fracs
         ]
+        weight_headers = [
+            f"Weight {m} (kJ/mole)" for m in range(numTemperatures)
+        ]
         headers = (
             ["Step", "Aim Temp (K)"]
             + frac_headers
@@ -278,6 +301,7 @@ class SST2(object):
                 "E solvent (kJ/mole)",
                 "E solvent-solute (kJ/mole)",
             ]
+            + weight_headers
         )
         print(",".join(headers), file=self._out)
 
@@ -467,6 +491,7 @@ class SST2(object):
                 E_solvent.value_in_unit(unit.kilojoule_per_mole),
                 E_solute_solvent.value_in_unit(unit.kilojoule_per_mole),
             ]
+            + self.weights
         )
 
         print(
@@ -476,12 +501,23 @@ class SST2(object):
         )
     
     def __del__(self):
-        if self._openedFile:
+        if getattr(self, "_openedFile", False):
             self._out.close()
 
     @property
     def weights(self):
-        return [x - self._weights[0] for x in self._weights]
+        """Effective rung free energies f_m - f_0 in kJ/mol as used by the
+        acceptance rule right now: the fixed weights, or the on-the-fly
+        estimate chained over adjacent rungs."""
+        if not self._updateWeights:
+            return [x - self._weights[0] for x in self._weights]
+        ladder = [0.0]
+        for m in range(len(self._weights) - 1):
+            ladder.append(
+                ladder[-1]
+                + self._compute_weight(m, m + 1).value_in_unit(unit.kilojoules_per_mole)
+            )
+        return ladder
 
     def step(self, steps):
         """Advance the simulation by integrating a specified number of time steps."""
@@ -534,14 +570,59 @@ class SST2(object):
 
 
 
-    def _attemptTemperatureChange(self, E_frac_dict, E_pw_unscaled):
-        """Attempt to move to a different temperature.
+    def _log_weights(self, E_frac_dict, E_pw_unscaled):
+        r"""Log-weight of every rung for the current configuration, relative
+        to the current rung, in units of kT_ref:
 
-        Acceptance log probability:
-        $$\\Delta_{i \\to j} = \\sum_t (\\lambda_i^{f_t} - \\lambda_j^{f_t})
-        \\cdot \\tilde{E}_t(X)
-        + (\\lambda_i^{1/2} - \\lambda_j^{1/2}) \\cdot \\tilde{E}_{pw}(X)
-        + (w_j - w_i)$$
+        $$\Delta_{i \to j} / kT = \big[\sum_t (\lambda_i^{f_t} - \lambda_j^{f_t})
+        \tilde{E}_t(X) + (\lambda_i^{1/2} - \lambda_j^{1/2}) \tilde{E}_{pw}(X)
+        + (w_j - w_i)\big] / kT_{ref}$$
+
+        Parameters
+        ----------
+        E_frac_dict : dict {frac: unit.Quantity}
+            Unscaled energy per fraction group at the current configuration
+        E_pw_unscaled : unit.Quantity
+            Unscaled solute-solvent energy at the current configuration
+
+        Returns
+        -------
+        numpy.ndarray
+            log weights, entry ``currentTemperature`` is 0
+        """
+        temp_i = self.currentTemperature
+        lambda_i = self.lambdas[temp_i]
+        weights = self.weights  # f_m - f_0, kJ/mol
+        E_t = {
+            frac: E_frac_dict.get(frac, 0 * unit.kilojoules_per_mole).value_in_unit(
+                unit.kilojoule_per_mole
+            )
+            for frac in self._e_fracs
+        }
+        E_pw = E_pw_unscaled.value_in_unit(unit.kilojoule_per_mole)
+
+        kT = unit.BOLTZMANN_CONSTANT_kB * self.temperatures[self.temp_ref_index] * unit.AVOGADRO_CONSTANT_NA
+        kT = kT.value_in_unit(unit.kilojoule_per_mole)
+
+        log_w = np.zeros(len(self.lambdas))
+        for j, lambda_j in enumerate(self.lambdas):
+            if j == temp_i:
+                continue
+            lp = 0.0
+            for frac in self._e_fracs:
+                lp += (lambda_i ** frac - lambda_j ** frac) * E_t[frac]
+            lp += (lambda_i ** 0.5 - lambda_j ** 0.5) * E_pw
+            lp += weights[j] - weights[temp_i]
+            log_w[j] = lp / kT
+        return log_w
+
+    def _attemptTemperatureChange(self, E_frac_dict, E_pw_unscaled):
+        """Attempt to move to a different rung.
+
+        ``move == "gibbs"``: draw the new rung from the conditional
+        distribution p(j | X) proportional to exp(log_w[j]) over all rungs.
+        ``move == "neighbor"``: propose i-1 or i+1 with probability 1/2,
+        reject proposals outside the ladder, accept with min(1, exp(log_w)).
 
         Parameters
         ----------
@@ -549,55 +630,32 @@ class SST2(object):
             Unscaled energy per fraction group at current configuration
         E_pw_unscaled : unit.Quantity
             Unscaled solute-solvent energy at current configuration
+
+        Returns
+        -------
+        int
+            The rung index after the attempt
         """
-        temp_i   = self.currentTemperature
-        lambda_i = self.lambdas[temp_i]
+        temp_i = self.currentTemperature
+        log_w = self._log_weights(E_frac_dict, E_pw_unscaled)
 
-        # Build list of neighboring temperature indices
-        temp_list = []
-        if temp_i != 0:
-            temp_list.append(temp_i - 1)
-        if temp_i < len(self._weights) - 1:
-            temp_list.append(temp_i + 1)
+        if self.move == "gibbs":
+            p = np.exp(log_w - log_w.max())
+            p /= p.sum()
+            r = self._rng.random()
+            new_index = int(np.searchsorted(np.cumsum(p), r, side="right"))
+            new_index = min(new_index, len(p) - 1)
+        else:
+            new_index = temp_i + (1 if self._rng.random() < 0.5 else -1)
+            if new_index < 0 or new_index >= len(self.lambdas):
+                return temp_i
+            if log_w[new_index] < 0 and self._rng.random() >= np.exp(log_w[new_index]):
+                return temp_i
 
-        logProbability = []
-        for j in temp_list:
-            lambda_j = self.lambdas[j]
-
-            # Sum over fractional terms: (lambda_i^f - lambda_j^f) * E_t_unscaled
-            log_prob = 0 * unit.kilojoules_per_mole
-            for frac in self._e_fracs:
-                E_t = E_frac_dict.get(frac, 0 * unit.kilojoules_per_mole)
-                log_prob += (lambda_i ** frac - lambda_j ** frac) * E_t
-
-            # Solute-solvent contribution: (lambda_i^0.5 - lambda_j^0.5) * E_pw
-            log_prob += (lambda_i ** 0.5 - lambda_j ** 0.5) * E_pw_unscaled
-
-            # Weight difference w_j - w_i
-            log_prob += self._compute_weight(temp_i, j)
-
-            logProbability.append(log_prob._value)
-
-        # Metropolis criterion: p = exp(log_prob / kT)
-        # Note: log_prob is already in energy units (kJ/mol),
-        # kT = kB * T_ref in kJ/mol
-        kT = unit.BOLTZMANN_CONSTANT_kB * self.temperatures[self.temp_ref_index] * unit.AVOGADRO_CONSTANT_NA
-        kT = kT.value_in_unit(unit.kilojoule_per_mole)
-
-        probability = [np.exp(lp / kT) for lp in logProbability]
-
-        # Shuffle to avoid systematic bias toward lower temperature
-        index_list = list(range(len(temp_list)))
-        random.shuffle(index_list)
-        r = random.random()
-
-        for i in index_list:
-            if r < probability[i]:
-                self.currentTemperature = temp_list[i]
-                self.rest2.scale_nonbonded_torsion(
-                    self.lambdas[temp_list[i]]
-                )
-                break
+        if new_index != temp_i:
+            self.currentTemperature = new_index
+            self.rest2.scale_nonbonded_torsion(self.lambdas[new_index])
+        return new_index
 
 def run_sst2(
     sys_rest2,
