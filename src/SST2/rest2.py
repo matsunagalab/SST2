@@ -213,6 +213,7 @@ class REST2:
         hydrogenMass=1.0 * unit.amu,
         exclude_Pro_omegas=False,
         subsystem="forcefield",
+        charge_unscaled_index=None,
     ):
         """Initialize the REST2 class
 
@@ -272,6 +273,17 @@ class REST2:
             ``system`` itself (``forcefield`` may then be None; required for
             Systems that have no ForceField, e.g. Amber prmtop or a
             serialized system.xml).  PME only.
+        charge_unscaled_index : list, optional
+            Solute atoms whose charges are *not* scaled (their Lennard-Jones
+            epsilon and torsions still are).  Per-atom factors: charge
+            sqrt(lambda) on the other solute atoms, 1 on these and on the
+            solvent; epsilon lambda on every solute atom, 1 on the solvent.
+            Pair energies then scale as Coulomb lambda (charged solute pairs),
+            sqrt(lambda) (charged solute - rest), LJ lambda (solute pairs),
+            sqrt(lambda) (solute - solvent).  The nonbonded part of the
+            decomposition is computed from unscaled Coulomb-only and LJ-only
+            copies of the System.  Needs ``subsystem="copy"``, PME and
+            ``nonbonded_scale=True``; not available with CHARMM NBFIX/LJ14.
         """
 
         if subsystem not in ("forcefield", "copy"):
@@ -288,10 +300,29 @@ class REST2:
         self.scale = 1.0
         self.nonbonded_scale = nonbonded_scale
 
+        self.charge_unscaled_index = sorted(set(int(i) for i in (charge_unscaled_index or [])))
+        self._q_unscaled = set(self.charge_unscaled_index)
+        if self._q_unscaled:
+            if not nonbonded_scale:
+                raise ValueError("charge_unscaled_index needs nonbonded_scale=True")
+            if subsystem != "copy":
+                raise NotImplementedError("charge_unscaled_index needs subsystem='copy'")
+            if nonbondedMethod != app.PME:
+                raise NotImplementedError("charge_unscaled_index supports PME only")
+            if not self._q_unscaled <= set(self.solute_index):
+                raise ValueError("charge_unscaled_index must be a subset of solute_index")
+            logger.info(
+                f"- {len(self._q_unscaled)} solute atoms keep unscaled charges "
+                f"(LJ and torsions scaled), {len(self.solute_index) - len(self._q_unscaled)} "
+                "fully scaled"
+            )
+
         if nonbonded_scale:
             self._check_charge_neutrality()
 
         self._setup_special_forces(exclude_Pro_omegas)
+        if self._q_unscaled and (self.NBFIX_flag or self.lj14_flag):
+            raise NotImplementedError("charge_unscaled_index is not available with CHARMM NBFIX / LJ14 forces")
 
         self._create_subsystem_simulations(
             nonbondedMethod=nonbondedMethod,
@@ -306,6 +337,9 @@ class REST2:
             dt=dt,
             temperature=temperature,
         )
+
+        if self._q_unscaled:
+            self._create_split_nb_contexts(platform_name)
 
         self.setup_simulation(
             integrator,
@@ -506,6 +540,81 @@ class REST2:
         logger.info(f"  E_solvent             = {E_solvent}")
         logger.info(f"  E_cross_nb            = {E_cross_nb}")
 
+
+    def _charge_factor(self, index, sqrt_scale):
+        """Charge scaling factor of a (global) solute atom."""
+        return 1.0 if index in self._q_unscaled else sqrt_scale
+
+    def _create_split_nb_contexts(self, platform_name):
+        """Unscaled Coulomb-only and LJ-only copies of the System for the
+        nonbonded decomposition with ``charge_unscaled_index``.
+
+        With C = charge-scaled solute atoms, S = all solute atoms, O = solvent:
+
+        * lambda part       = Coul(C, C) + LJ(S, S)
+        * sqrt(lambda) part = Coul(C, rest) + LJ(S, O)
+
+        each evaluated from particle subsets with the original parameters,
+        the cross terms by subtraction (all - subset - complement).
+        """
+        n = self.system.getNumParticles()
+        charged = [i for i in self.solute_index if i not in self._q_unscaled]
+        not_charged = sorted(set(range(n)) - set(charged))
+        specs = {
+            "coul_all": (list(range(n)), "coul"),
+            "coul_C": (charged, "coul"),
+            "coul_notC": (not_charged, "coul"),
+            "lj_all": (list(range(n)), "lj"),
+            "lj_S": (list(self.solute_index), "lj"),
+            "lj_O": (list(self.solvent_index), "lj"),
+        }
+        platform = openmm.Platform.getPlatformByName(platform_name)
+        prop = {"Precision": "mixed"} if platform_name in ("CUDA", "OpenCL", "HIP") else {}
+        self._split_contexts = {}
+        for name, (index, kind) in specs.items():
+            if not index:
+                self._split_contexts[name] = None
+                continue
+            sub, _ = build_subsystem(self._pristine_system, index)
+            for k in reversed(range(sub.getNumForces())):
+                if not isinstance(sub.getForce(k), openmm.NonbondedForce):
+                    sub.removeForce(k)
+            nb = sub.getForce(0)
+            for p in range(nb.getNumParticles()):
+                q, sig, eps = nb.getParticleParameters(p)
+                if kind == "coul":
+                    nb.setParticleParameters(p, q, sig, 0.0 * eps)
+                else:
+                    nb.setParticleParameters(p, 0.0 * q, sig, eps)
+            for e in range(nb.getNumExceptions()):
+                p1, p2, qq, sig, eps = nb.getExceptionParameters(e)
+                if kind == "coul":
+                    nb.setExceptionParameters(e, p1, p2, qq, sig, 0.0 * eps)
+                else:
+                    nb.setExceptionParameters(e, p1, p2, 0.0 * qq, sig, eps)
+            context = openmm.Context(sub, openmm.VerletIntegrator(0.001), platform, prop)
+            self._split_contexts[name] = (context, np.array(index))
+        logger.info(
+            f"- Split nonbonded decomposition: {len(charged)} charge-scaled atoms, "
+            f"{len(self._q_unscaled)} LJ-only atoms, contexts {sorted(specs)}"
+        )
+
+    def _split_nb_energies(self, positions, box_vector):
+        """Unscaled (lambda part, sqrt(lambda) part) of the nonbonded energy."""
+        E = {}
+        for name, item in self._split_contexts.items():
+            if item is None:
+                E[name] = 0 * unit.kilojoules_per_mole
+                continue
+            context, index = item
+            context.setPeriodicBoxVectors(*box_vector)
+            context.setPositions(positions[index])
+            E[name] = context.getState(getEnergy=True).getPotentialEnergy()
+        lam = E["coul_C"] + E["lj_S"]
+        sqrt_lam = (E["coul_all"] - E["coul_C"] - E["coul_notC"]) + (
+            E["lj_all"] - E["lj_S"] - E["lj_O"]
+        )
+        return lam, sqrt_lam
 
     def add_scale_NBFIX(self, NBFIX_force, solute_index):
         """Extract initial solute Lennard-Jones indexes and values (sigma, epsilon).
@@ -1466,25 +1575,49 @@ class REST2:
         nonbonded_force = self.system_forces["NonbondedForce"]
         sqrt_scale = np.sqrt(scale)
 
-        for i in self.solute_index:
-            q, sigma, eps = self.init_nb_param[i]
-            nonbonded_force.setParticleParameters(
-                i, q * sqrt_scale, sigma, eps * scale
-            )
+        if not self._q_unscaled:
+            for i in self.solute_index:
+                q, sigma, eps = self.init_nb_param[i]
+                nonbonded_force.setParticleParameters(
+                    i, q * sqrt_scale, sigma, eps * scale
+                )
 
-        for i in range(len(self.init_nb_exept_index)):
-            index = self.init_nb_exept_index[i]
-            p1, p2, q, sigma, eps = self.init_nb_exept_value[i]
-            nonbonded_force.setExceptionParameters(
-                index, p1, p2, q * scale, sigma, eps * scale
-            )
-        # Boundary 1-4 pairs are solute-solvent interactions: sqrt(lambda)
-        for i in range(len(self.init_nb_exept_boundary_index)):
-            index = self.init_nb_exept_boundary_index[i]
-            p1, p2, q, sigma, eps = self.init_nb_exept_boundary_value[i]
-            nonbonded_force.setExceptionParameters(
-                index, p1, p2, q * sqrt_scale, sigma, eps * sqrt_scale
-            )
+            for i in range(len(self.init_nb_exept_index)):
+                index = self.init_nb_exept_index[i]
+                p1, p2, q, sigma, eps = self.init_nb_exept_value[i]
+                nonbonded_force.setExceptionParameters(
+                    index, p1, p2, q * scale, sigma, eps * scale
+                )
+            # Boundary 1-4 pairs are solute-solvent interactions: sqrt(lambda)
+            for i in range(len(self.init_nb_exept_boundary_index)):
+                index = self.init_nb_exept_boundary_index[i]
+                p1, p2, q, sigma, eps = self.init_nb_exept_boundary_value[i]
+                nonbonded_force.setExceptionParameters(
+                    index, p1, p2, q * sqrt_scale, sigma, eps * sqrt_scale
+                )
+        else:
+            # charge_unscaled_index: per-atom charge factor, epsilon lambda on
+            # every solute atom (pair factors follow from the products)
+            solute_set = set(self.solute_index)
+            for i in self.solute_index:
+                q, sigma, eps = self.init_nb_param[i]
+                nonbonded_force.setParticleParameters(
+                    i, q * self._charge_factor(i, sqrt_scale), sigma, eps * scale
+                )
+            for i in range(len(self.init_nb_exept_index)):
+                index = self.init_nb_exept_index[i]
+                p1, p2, q, sigma, eps = self.init_nb_exept_value[i]
+                fq = self._charge_factor(p1, sqrt_scale) * self._charge_factor(p2, sqrt_scale)
+                nonbonded_force.setExceptionParameters(
+                    index, p1, p2, q * fq, sigma, eps * scale
+                )
+            for i in range(len(self.init_nb_exept_boundary_index)):
+                index = self.init_nb_exept_boundary_index[i]
+                p1, p2, q, sigma, eps = self.init_nb_exept_boundary_value[i]
+                s_atom = p1 if p1 in solute_set else p2
+                nonbonded_force.setExceptionParameters(
+                    index, p1, p2, q * self._charge_factor(s_atom, sqrt_scale), sigma, eps * sqrt_scale
+                )
         # Need to fix simulation
         nonbonded_force.updateParametersInContext(self.simulation.context)
 
@@ -1566,13 +1699,18 @@ class REST2:
         for i, index in enumerate(self.solute_index):
             q, sigma, eps = self.init_nb_param[index]
             nonbonded_force.setParticleParameters(
-                i, q * scale_sqrt, sigma, eps * scale
+                i, q * self._charge_factor(index, scale_sqrt), sigma, eps * scale
             )
 
         for i in range(nonbonded_force.getNumExceptions()):
             p1, p2, q, sigma, eps = self.init_nb_exept_solute_value[i]
+            if self._q_unscaled:
+                fq = (self._charge_factor(self.solute_index[p1], scale_sqrt)
+                      * self._charge_factor(self.solute_index[p2], scale_sqrt))
+            else:
+                fq = scale
             nonbonded_force.setExceptionParameters(
-                i, p1, p2, q * scale, sigma, eps * scale
+                i, p1, p2, q * fq, sigma, eps * scale
             )
 
         nonbonded_force.updateParametersInContext(self.simulation_solute.context)
@@ -1615,7 +1753,7 @@ class REST2:
             E_frac_dict[frac] = 0 * unit.kilojoules_per_mole
         E_frac_dict[frac] += unscaled
 
-    def _accumulate_solute_energies(self, solute_force):
+    def _accumulate_solute_energies(self, solute_force, include_nb=True):
         """Classify solute-subsystem forces into scaled NB, raw NB, and not-scaled.
 
         Parameters
@@ -1632,16 +1770,17 @@ class REST2:
         solute_nb : unit.Quantity
             Raw (still-scaled) solute NB energy for cross-term subtraction.
         """
+        use_nb = self.nonbonded_scale and include_nb
         SOLUTE_NB_SCALED = (
-            {"NonbondedForce", "LennardJones"} if self.nonbonded_scale else {}
+            {"NonbondedForce", "LennardJones"} if use_nb else {}
         )
         SOLUTE_NB_RAW = (
-            {"LennardJones14"} if self.nonbonded_scale else {}
+            {"LennardJones14"} if use_nb else {}
         )
-        # When nonbonded_scale=False, NB forces from the solute system are
-        # unused: no subtraction needed, no unscaling needed.
+        # When nonbonded_scale=False (or the nonbonded part comes from the
+        # split contexts), NB forces from the solute system are unused.
         SOLUTE_NB_UNUSED = (
-            {} if self.nonbonded_scale
+            {} if use_nb
             else {"NonbondedForce", "LennardJones", "LennardJones14"}
         )
         SOLUTE_NOT_SCALED = {
@@ -1858,6 +1997,21 @@ class REST2:
         solute_force, solvent_force, system_force = (
             self.compute_solute_solvent_system_energy()
         )
+
+        if self._q_unscaled:
+            E_frac_dict, E_solute_not_scaled, _ = self._accumulate_solute_energies(
+                solute_force, include_nb=False
+            )
+            E_solvent, _ = self._accumulate_solvent_energies(solvent_force)
+            _, E_solute_not_scaled = self._accumulate_system_nb_energies(
+                system_force, E_frac_dict, E_solute_not_scaled
+            )
+            state = self.simulation.context.getState(getPositions=True)
+            lam_nb, sqrt_lam_nb = self._split_nb_energies(
+                state.getPositions(asNumpy=True), state.getPeriodicBoxVectors()
+            )
+            E_frac_dict[1.0] = E_frac_dict.get(1.0, 0 * unit.kilojoules_per_mole) + lam_nb
+            return (E_frac_dict, E_solute_not_scaled, E_solvent, sqrt_lam_nb)
 
         E_frac_dict, E_solute_not_scaled, solute_nb = self._accumulate_solute_energies(solute_force)
         E_solvent, solvent_nb = self._accumulate_solvent_energies(solvent_force)

@@ -159,6 +159,7 @@ def run_sst2_from_xml(
     weights=None,
     restart_json=None,
     extra_provenance=None,
+    charge_unscaled_indices=None,
 ):
     """Run one SST2 walker.  Returns the sidecar dict (also written to
     ``<out_dir>/<name>_sst2_state.json``)."""
@@ -174,6 +175,9 @@ def run_sst2_from_xml(
     if solute_indices[-1] >= system.getNumParticles():
         raise ValueError("solute index out of range")
     logger.info(f"- {len(solute_indices)} solute atoms of {system.getNumParticles()}")
+    charge_unscaled_indices = sorted(set(int(i) for i in (charge_unscaled_indices or [])))
+    if charge_unscaled_indices and not set(charge_unscaled_indices) <= set(solute_indices):
+        raise ValueError("charge_unscaled_indices must be a subset of solute_indices")
 
     temperatures = [float(t) for t in temperatures]
     if ref_temperature is None:
@@ -213,6 +217,7 @@ def run_sst2_from_xml(
         nonbondedMethod=app.PME,
         exclude_Pro_omegas=exclude_pro_omegas,
         subsystem="copy",
+        charge_unscaled_index=charge_unscaled_indices,
     )
     if box is not None:
         rest2.simulation.context.setPeriodicBoxVectors(*box)
@@ -267,6 +272,7 @@ def run_sst2_from_xml(
             "topology_pdb": os.path.abspath(topology_pdb),
             "state_xml": os.path.abspath(state_xml) if state_xml else None,
             "solute_atoms": len(solute_indices),
+            "charge_unscaled_atoms": len(charge_unscaled_indices),
             "boundary_exceptions": len(getattr(rest2, "init_nb_exept_boundary_index", [])),
             "torsion_buckets": {
                 f.getName(): f.getNumTorsions()
@@ -326,6 +332,10 @@ def parser():
     p.add_argument("--friction-ps", type=float, default=1.0)
     p.add_argument("--only-dihed", action="store_true", help="scale torsions only (gREST dihedral)")
     p.add_argument("--exclude-pro-omega", action="store_true")
+    p.add_argument(
+        "--charge-unscaled-indices", default=None,
+        help="JSON list of solute atom indices whose charges are not scaled (LJ and torsions are)",
+    )
     p.add_argument("--weights-json", default=None, help="JSON list of fixed rung free energies (kJ/mol)")
     p.add_argument("--restart-json", default=None, help="sidecar of a previous run of this walker")
     p.add_argument("-v", "--verbose", action="store_true")
@@ -341,6 +351,10 @@ def main(argv=None):
     )
     with open(args.solute_indices) as fh:
         solute = json.load(fh)
+    charge_unscaled = None
+    if args.charge_unscaled_indices:
+        with open(args.charge_unscaled_indices) as fh:
+            charge_unscaled = json.load(fh)
     weights = None
     if args.weights_json:
         with open(args.weights_json) as fh:
@@ -369,6 +383,7 @@ def main(argv=None):
         exclude_pro_omegas=args.exclude_pro_omega,
         weights=weights,
         restart_json=args.restart_json,
+        charge_unscaled_indices=charge_unscaled,
     )
     print(json.dumps({k: sidecar[k] for k in ("name", "rung", "step", "weights_kJ_per_mol", "e_num")}))
     return 0
