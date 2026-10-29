@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "SST2"
-version = "0.0.1+mdclaw.1"
+version = "0.0.1+mdclaw.2"
 dynamic = ["readme", "dependencies"]
 description = "`SST2` is a python library designed to conduct Simulated Solute Tempering (SST2) simulations using the openmm library."
 license = {text = "GPL-2.0"}
@@ -34,6 +34,12 @@ classifiers = [
     "Programming Language :: Python",
     "Topic :: Software Development",
 ]
+
+[project.optional-dependencies]
+# OpenMM is usually installed from conda (conda-forge, or a CUDA-specific
+# source build), which pip and uv cannot always recognise as providing the
+# `openmm` distribution. Require it only on request: pip install "SST2[openmm]".
+openmm = ["openmm>=7.7.0"]
 
 [project.scripts]
 sst2-from-xml = "SST2.driver:main"
